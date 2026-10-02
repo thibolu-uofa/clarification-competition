@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local analysis scripts and run artifacts (not part of a submission)
+tools/
+runs/
+data/splits/shard_*.txt
