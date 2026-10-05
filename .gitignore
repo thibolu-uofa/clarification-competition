@@ -222,6 +222,7 @@ tools/
 runs/
 data/splits/shard_*.txt
 data/splits/train_sample*.txt
+data/splits/smoke_*.txt
 # Result files. CONTRIBUTING.md: "Do not commit result files to the repository."
 data/curiosity_*.jsonl
 data/*_clarify_output*.jsonl
