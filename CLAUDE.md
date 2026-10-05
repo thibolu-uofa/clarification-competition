@@ -298,6 +298,8 @@ Tags are terse and were chosen badly; this is the glossary until they are rename
 | `tools/split_offset.py` | per-variant-cell pass rates reweighted onto val's composition, against the published val number where one exists |
 | `tools/run_arms.py` | runs the ablation suite two arms at a time; skips arms already complete, so an interrupted suite resumes |
 | `tests/test_helpers.py` | regression tests for the pure helpers; one assertion per trap below. `.venv/bin/python tests/test_helpers.py` |
+| `tools/ast_identity.py` | two files are behaviourally identical: AST compared with docstrings stripped, optional class rename |
+| `tools/dormant_check.py` | a flagged-off change cannot affect the result: strips the named additions and all logging, then compares against the baseline |
 | `runs/` | all outputs; `data/splits/train_sample{,800}.txt` are the fixed subsamples |
 
 The algorithm emits one JSON trace record per task via
@@ -361,12 +363,8 @@ n — the next ≥800-example run should test a different change, not re-measure
 The submission file carries no TODOs - a reviewer reads it first. Each item below keeps its
 measured ceiling so the next change is chosen on evidence rather than on which TODO was nearest.
 
-1. **Adjudicate a split vote with the clarification answer** (`final_program`). The groups are
-   sorted by `(failures_on_valid, -len(group))` and the first wins, which ignores the answer we
-   just paid a question for. **Correction to an earlier claim in this file:** the literal idea
-   ("break a tie") fires on only 3.0% of train / 4.0% of val tasks, ceiling **+2.7pp** - below
-   the noise. Widened to *every* split vote it fires on 14.4% of val (111 tasks passing 38.74%
-   against 70.90% when unanimous), ceiling **+4.6pp**. The wider scope is the one worth building.
+1. ~~Adjudicate a split vote with the clarification answer~~ — **built, measured, turned off.**
+   See "Things already tried". The code is still in the file behind `adjudicate_vote="never"`.
 2. **Per-input branch traces** (`run_candidates` / `SANDBOX_SCRIPT`). Instrument each candidate
    with `ast.NodeTransformer` so the sandbox records which conditions each input took. Enables 3
    and 4, and separates "inputs too weak" from "candidates share one reading" - today both look
@@ -399,6 +397,30 @@ Moot: drafting a second question from the remaining differences assumes a budget
 and the official setting fixes `max_clarification_turns=1`.
 
 ## Things already tried — don't redo them
+
+- **Adjudicating a split vote with the clarification answer: actively harmful on the tasks it
+  touched.** When the post-clarification vote split, one model call asked which group's
+  behaviour matched the author's answer instead of taking the majority. It worked exactly as
+  designed — fired on 104 of 815 train tasks (12.8%, matching the predicted rate), returned a
+  usable choice every time, overruled the majority on 31 of those (29.8%), and cost ~nothing
+  (13.8 vs 13.7 calls/task, $0.0066 vs $0.0065). Overall it read **+0.91pp** paired (39 gained,
+  32 lost, p=0.48) — but the attribution kills it, because **only the overruled tasks received
+  different treatment** and everywhere else the two runs differ by resampling alone:
+
+  | slice | n | baseline | with adjudication | gained/lost |
+  |---|---|---|---|---|
+  | never fired (pure re-roll) | 679 | 41.5% | 43.0% | 36 / 26 |
+  | fired, agreed with majority | 67 | 31.3% | 29.9% | 3 / 4 |
+  | **fired, overruled the majority** | **27** | **7.4%** | **0.0%** | **0 / 2** |
+
+  Not one overruled task passed. The headline gain is resampling luck in the untouched slice.
+  **The lesson generalises beyond this change:** a split vote marks a task nobody solves
+  (baseline 7.4%), not a choice made wrongly, so the "+4.6pp ceiling" computed by assuming
+  split-vote tasks could be lifted to unanimous-level performance was never real — it was a
+  selection effect, flagged at the time and then under-weighted anyway. Treat every
+  "if slice X behaved like slice Y" ceiling in this file the same way.
+  `adjudicate_vote` is left at `"never"`; `tools/dormant_check.py` proves the code cannot
+  affect the returned program at that setting, so the val 0.6161 still describes the file.
 
 - **Crash-repair alone: no effect.** Cut input failures 317 → 104 but Pass@1 moved +1 task of
   160. Paired view: 9 gained, 8 lost, repair implicated in 1. Crash-freeness on generated

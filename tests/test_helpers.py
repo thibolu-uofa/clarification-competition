@@ -356,6 +356,130 @@ def test_overrides_reach_the_config():
     assert algorithm.config["num_candidates"] == 4  # untouched default
 
 
+# --- adjudicating a split vote with the author's answer ----------------------------------
+
+
+@check
+def test_adjudication_scope_respects_the_config():
+    """`never` must reproduce the plain majority exactly; `ties` only fires on equal sizes."""
+    groups_tied = [[0], [1]]
+    groups_clear = [[0, 1], [2]]
+    outputs = [
+        [value(["int", 1])],
+        [value(["int", 2])],
+        [value(["int", 3])],
+    ]
+    valid = [0]
+
+    never = fresh(adjudicate_vote="never")
+    assert never.adjudication_needed(groups_tied, outputs, valid) is False
+    assert never.adjudication_needed(groups_clear, outputs, valid) is False
+
+    ties = fresh(adjudicate_vote="ties")
+    assert ties.adjudication_needed(groups_tied, outputs, valid) is True
+    assert ties.adjudication_needed(groups_clear, outputs, valid) is False
+
+    split = fresh(adjudicate_vote="split")
+    assert split.adjudication_needed(groups_tied, outputs, valid) is True
+    assert split.adjudication_needed(groups_clear, outputs, valid) is True
+    # A single surviving group is not a disagreement, whatever the scope.
+    assert split.adjudication_needed([[0, 1]], outputs, valid) is False
+
+
+@check
+def test_behaviours_render_as_python():
+    algorithm = fresh()
+    algorithm.current_inputs = ["([1, 2],)", "([],)"]
+    outputs = [
+        [value(["int", 3]), value(["none", None])],
+        [value(["int", 3]), error("ValueError")],
+    ]
+    rendered = algorithm.render_behaviours(outputs, [[0], [1]], [1], total=2)
+    assert "Behaviour 1 (1 of 2 implementations)" in rendered
+    assert "Behaviour 2 (1 of 2 implementations)" in rendered
+    assert "returns None" in rendered and "raises ValueError" in rendered
+    # The canonical encoding and JSON spellings must never reach a prompt.
+    assert "null" not in rendered and '"none"' not in rendered
+
+
+@check
+def test_choice_parsing_rejects_what_it_cannot_use():
+    algorithm = fresh()
+    assert algorithm.parse_choice("CHOICE=2", 3) == 1
+    assert algorithm.parse_choice("CHOICE=`1`", 3) == 0
+    assert algorithm.parse_choice("CHOICE=Behaviour 3", 3) == 2
+    # Out of range, absent, or no number at all: keep the majority rather than guess.
+    assert algorithm.parse_choice("CHOICE=4", 3) is None
+    assert algorithm.parse_choice("CHOICE=0", 3) is None
+    assert algorithm.parse_choice("I think the first one", 3) is None
+    assert algorithm.parse_choice("", 3) is None
+
+
+@check
+def test_adjudication_declines_without_a_legible_difference():
+    """No clarification, or no trustworthy input where the groups differ: keep the majority.
+
+    `env` is None here because neither path may reach a model call.
+    """
+    algorithm = fresh()
+    algorithm.current_inputs = ["([1],)"]
+    outputs = [[value(["int", 1])], [value(["int", 1])]]
+    assert algorithm.adjudicate(None, {}, [], outputs, [[0], [1]], [0], 2) is None
+    # Groups that agree on every valid input give nothing to show.
+    assert algorithm.adjudicate(None, {"prompt": "p"}, [("q", "a")], outputs, [[0], [1]], [0], 2) is None
+
+
+class _StubEnv:
+    """Just enough environment to exercise `adjudicate` without a model or a sandbox."""
+
+    def __init__(self, reply):
+        self.reply = reply
+        self.prompts = []
+
+    def llm(self, messages):
+        self.prompts.append(messages)
+        return self.reply
+
+
+@check
+def test_adjudication_overrules_the_majority_when_the_answer_says_so():
+    """The whole path: render, ask, parse, and return the non-majority group."""
+    algorithm = fresh()
+    algorithm.current_inputs = ["([1, 2],)"]
+    # Group 1 is the majority (two candidates), group 2 is a single dissenter.
+    outputs = [
+        [value(["int", 3])],
+        [value(["int", 3])],
+        [value(["int", 4])],
+    ]
+    groups = [[0, 1], [2]]
+    env = _StubEnv("CHOICE=2")
+
+    picked = algorithm.adjudicate(
+        env, {"prompt": "add the values"}, [("Inclusive?", "Yes, inclusive.")],
+        outputs, groups, [0], 3,
+    )
+    assert picked == 1, picked  # the dissenting group, against the majority
+    assert algorithm.trace["llm_calls"] == 1
+
+    # The prompt must carry the author's answer and both behaviours, in Python syntax.
+    text = env.prompts[0]
+    assert "Yes, inclusive." in text
+    assert "returns 3" in text and "returns 4" in text
+
+
+@check
+def test_adjudication_keeps_the_majority_on_an_unusable_reply():
+    algorithm = fresh()
+    algorithm.current_inputs = ["([1, 2],)"]
+    outputs = [[value(["int", 3])], [value(["int", 4])]]
+    for reply in ("CHOICE=9", "no idea", ""):
+        picked = algorithm.adjudicate(
+            _StubEnv(reply), {"prompt": "p"}, [("q", "a")], outputs, [[0], [1]], [0], 2
+        )
+        assert picked is None, reply
+
+
 if __name__ == "__main__":
     failures = []
     for test in CHECKS:
