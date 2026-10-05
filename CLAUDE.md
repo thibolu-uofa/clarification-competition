@@ -7,6 +7,18 @@ as a PR to the upstream repo. Everything else here is local scaffolding.
 - **Design doc / plan:** `clarify/algorithms/curiosityByDesign_plan.py` (prose in comments)
 - **Team:** Curiosity by Design — Thibaud (`lutellie@ualberta.ca`)
 
+## Deadlines (from CONTRIBUTING.md; AoE 23:59)
+
+| | |
+|---|---|
+| **Oct 9, 2026** | **Registration — a PR must be open.** A draft with a stub file is enough. Not done yet: `origin` is only the fork `thibolu-uofa/clarification-competition`, and no PR is open against `serval-uni-lu/clarification-competition`. |
+| Nov 6, 2026 | Submission deadline; commits after it are ignored. The algorithm can keep changing until then. |
+| Nov 20, 2026 | Final results, after the organizers run every merged system on the hidden test set. |
+
+**Only systems that match or beat the strongest baseline are ranked**, and the strongest baseline
+is Okanagan at TDS 0.5917 — that is where the 0.592 target comes from. Ranking is by TDS with nDCG
+as the tie-breaker, on the **private test set**, not on val.
+
 ## Spending rule (read first)
 
 **Never start a run that spends API credits without the user asking in that message.**
@@ -41,8 +53,13 @@ optimise the sandbox.
   merges `DEFAULT_CONFIG` with CLI overrides, so no constructor is needed.
 - Exactly one public `ClarificationAlgorithmBase` subclass per file; prefix experiments with `_`.
 - Standard library plus existing `pyproject.toml` deps only.
-- **Do not tune on the validation split** — the PR template requires certifying this. Develop
-  on train; val is a one-shot reported number.
+- **Do not tune on the validation split.** The exact certification in
+  `.github/PULL_REQUEST_TEMPLATE.md` is "We developed on the released splits only and did not tune
+  on validation instances". Running val to *measure* is the sanctioned workflow (CONTRIBUTING.md
+  Step 4, and the public leaderboard is val); what is forbidden is choosing a configuration by its
+  val result. Running a *baseline* on val involves no decision about our submission and so is
+  outside the certification entirely. "One shot" is our own stricter convention, kept because each
+  extra val run is an invitation to select on it.
 
 ## Official evaluation settings
 
@@ -133,6 +150,18 @@ exceptions. Paired on the 773 examples we both cover:
 we win on TDS too despite paying the ask-rate discount that DirectLLM does not. **We are above
 the weakest baseline, not below it.**
 
+**All three on the same 773 train examples** (paired; ours is `part`):
+
+| | TDS | Pass@1 | ask% | $/task |
+|---|---|---|---|---|
+| ours | **0.3789** | **39.46%** | 100.0 | 0.0065 |
+| Okanagan | 0.3490 | 36.23% | 90.2 | 0.0006 |
+| DirectLLM | 0.3247 | 32.47% | 0.0 | 0.0004 |
+
+vs Okanagan: **+3.23pp**, 61 gained / 36 lost. So on train we are the best of the three — by a
+clear margin over DirectLLM and a modest one over Okanagan, which gets there for a tenth of the
+cost.
+
 ### The train/val gap is real and bigger than composition
 
 DirectLLM scores **32.76%** on train (n=815) and **49.74%** on val (published). Two parts:
@@ -144,12 +173,33 @@ DirectLLM scores **32.76%** on train (n=815) and **49.74%** on val (published). 
   Train is simply harder, cell for cell.
 
 So post-stratification alone **under-predicts val by ~12pp** and must not be used on its own —
-it is validated against a baseline's known val number, not trusted a priori. Transferring
-DirectLLM's measured offset to us puts our val-equivalent Pass@1 at roughly **56–60%**
-(39.46% + 17pp raw, or 48.28% + 12pp composition-adjusted): above ClarifyGPT (57.3%), near
-Okanagan (61.3%), below GatedClarification (66.8%). **One baseline, one offset** — an Okanagan
-run on the same train sample is the independent check, and until it lands the transfer is a
-single data point, not a calibration.
+it is validated against a baseline's known val number, not trusted a priori.
+
+**Okanagan, the second baseline, breaks the transfer.** Also faithful ($0.00063/task vs published
+$0.0006, ask rate 90.2% vs 88.6%, no exceptions), and on the same train sample it scores **36.20%**
+against a published val **61.30%**:
+
+| baseline | train (ours, n=815) | val (published) | raw offset | offset after composition |
+|---|---|---|---|---|
+| DirectLLM | 32.76% | 49.74% | +16.98pp | +12.08pp |
+| Okanagan | 36.20% | 61.30% | **+25.10pp** | **+19.24pp** |
+
+The two offsets disagree by 7–8pp, so **the train→val offset is algorithm-dependent and cannot be
+used to translate our number**. Any claim of the form "our train 39.5% means val X%" is unsupported;
+the honest statement is a range so wide it decides nothing (≈52% to ≈59%).
+
+Two hypotheses, not yet separated:
+- **H1** train is genuinely harder and stronger algorithms gain more from val's easier tasks;
+- **H2** the published val numbers were produced under conditions we are not reproducing (a
+  different benchmark revision or model snapshot), in which case the leaderboard is not a yardstick
+  for us at all.
+
+Both baselines reproduced their published **cost/task and ask rate** almost exactly, which shows we
+are running the algorithms as intended — but says nothing about which hypothesis holds. The
+decisive, cheap test is **DirectLLM on val** (770 examples, ~$0.33): if it reproduces ~49.7%, H1
+holds; if it lands near its train 32.8%, H2 holds and every leaderboard comparison in this file is
+void. Running a *baseline* on val does not tune our submission, so it does not touch the
+certification — but it has not been run yet.
 
 ### Leaderboard reference (val, same official settings)
 
@@ -164,6 +214,40 @@ single data point, not a calibration.
 Okanagan is worth staring at: 61.3% at **$0.0006/task**, a tenth of ours, with 5 `env.llm` call
 sites. Our 13.7 calls/task buy a lower number.
 
+## Validation result (one-shot, 2026-10-05)
+
+Measured once, with `overrides: (defaults)`, on the full 770-example val split. 770/770 rows,
+zero exceptions, zero not-ok tasks, `docs/data/leaderboard.csv` untouched. The exact file is
+tagged **`baseline-val-0.6161`** and kept loadable as `clarify/algorithms/basic_curiosity.py`
+(class `BasicCuriosity`), which is the fallback submission.
+
+| | |
+|---|---|
+| TDS | **0.6161** |
+| Pass@1 | **64.16%** (sd 1.73pp) |
+| nDCG | 0.8675 |
+| clarification rate | 99.87% |
+| over-asking | 100.00% |
+| high-quality clarification | 86.87% |
+| cost/task | $0.0069 |
+
+Slices: unambiguous prompts 73.63% (n=91), ambiguous 62.89% (n=679); HumanEval 72.86% (n=350),
+MBPP 56.90% (n=420); by path, widened 68.10%, fallback 65.23%, difference 56.15%.
+
+**Position: 2nd of six**, above the strongest baseline (Okanagan 0.5917) and so rankable; below
+GatedClarification (0.6410). At sd 1.73pp on Pass@1 (±0.017 TDS) we are ~1.1 sd above
+ContractFirst and ~1.4 sd below the leader, and **ranking is on the private test set, not val.**
+
+**The measured train→val offset for our algorithm is +24.70pp** (39.46% → 64.16%), close to
+Okanagan's +25.10pp and nothing like DirectLLM's +16.98pp. This retires all three earlier
+translation estimates, which were wrong in the same direction: 48.3% (post-stratification alone),
+and the 52–59% range transferred from the baselines. **Do not estimate a val number from train
+again — the offset is algorithm-dependent and was understated every time.**
+
+nDCG is worth attention: 0.8675 on val against 0.96 on train, and high-quality clarification
+86.87% against 95.9%. nDCG is the ranking tie-breaker and 13% of val questions are marked down,
+which has never been looked at.
+
 ## Run names
 
 Tags are terse and were chosen badly; this is the glossary until they are renamed.
@@ -175,6 +259,8 @@ Tags are terse and were chosen badly; this is the glossary until they are rename
 | `base`, `repair` | early 160-example runs, pre-partition and +crash-repair |
 | `abl_*` | ablation arms at n=160, one config knob each (`abl_nopart` = `--partition_inputs False`) |
 | `base800_direct`, `base800_okanagan` | SDK baselines on our 815-example train sample |
+| `cbd_val` | the one-shot val run above: current algorithm, 770 examples |
+| `ratelimited_arms/` | four arms that measured the rate limiter, kept as evidence; see the concurrency note |
 
 ## Known SDK bugs and gotchas (not ours; work around them)
 
@@ -269,6 +355,48 @@ Input partitioning, input regeneration and crash-triggered repair have now been 
 together as one bundle (`part` run, see **Measured state**): +2.07pp paired, p=0.10. Nothing
 separates their individual contributions, and the bundle is not worth re-litigating at that
 n — the next ≥800-example run should test a different change, not re-measure this one.
+
+## Deferred ideas (were TODOs in the submission file; moved here 2026-10-05)
+
+The submission file carries no TODOs - a reviewer reads it first. Each item below keeps its
+measured ceiling so the next change is chosen on evidence rather than on which TODO was nearest.
+
+1. **Adjudicate a split vote with the clarification answer** (`final_program`). The groups are
+   sorted by `(failures_on_valid, -len(group))` and the first wins, which ignores the answer we
+   just paid a question for. **Correction to an earlier claim in this file:** the literal idea
+   ("break a tie") fires on only 3.0% of train / 4.0% of val tasks, ceiling **+2.7pp** - below
+   the noise. Widened to *every* split vote it fires on 14.4% of val (111 tasks passing 38.74%
+   against 70.90% when unanimous), ceiling **+4.6pp**. The wider scope is the one worth building.
+2. **Per-input branch traces** (`run_candidates` / `SANDBOX_SCRIPT`). Instrument each candidate
+   with `ast.NodeTransformer` so the sandbox records which conditions each input took. Enables 3
+   and 4, and separates "inputs too weak" from "candidates share one reading" - today both look
+   like one behaviour group. **Riskiest edit in the file:** it touches the one script that builds
+   the whole behaviour table, and a broken transformer loses every cell silently.
+3. **Coverage-guided widening** (`widen_search`). When every condition has been taken both ways,
+   more inputs cannot separate anything; add the divergent candidate instead. Needs 2.
+4. **Input shrinking and multi-input questions** (`pick_distinguishing_inputs`,
+   `questions_from_differences`). Shrink the chosen input while the split holds, and show two or
+   three inputs that split the same way so the model sees the rule, not the instance. The one
+   item with an independently measurable target: val nDCG 0.8675 / 86.87% high-quality.
+5. **Derive inputs from the candidates instead of asking** ("Option B" in
+   `notes/curiosity_by_design_plan.py`). Collect conditions and compared constants with `ast`,
+   use those and their neighbours as partition boundaries, filter through an `is_valid` the model
+   supplies once. 14.3% of generated inputs are rejected by every candidate - but val says tasks
+   with clean inputs pass 65.97% against 56.25%, a **+1.8pp** upper bound that is probably a
+   selection effect. Largest build, weakest evidence.
+6. **Decide `ask_when_agree`** (`fallback_question`). A question discounts the task ~4%, so
+   asking only pays when `pass_rate_with x 0.96 > pass_rate_without`. The arm was started and
+   killed when the suite was paused; still unmeasured.
+7. **Recover `candidate`-aliased functions** (`defines_entry_point`). Some prompts name the
+   function `candidate`; such a program is discarded today. Narrow: 76 of 771 train tasks never
+   got 2 usable candidates (passing 23.68%), and this is one of several causes.
+8. **A question-only behaviour signature** (`group_by_behaviour`). "Raise on empty input" vs
+   "return 0" is a real open requirement, but the final program cannot afford to raise, so the
+   raiser is discarded. Keeping it for *asking* while excluding it from the *vote* would recover
+   the question. Deliberate trade-off, documented in the docstring rather than deferred.
+
+Moot: drafting a second question from the remaining differences assumes a budget above one turn,
+and the official setting fixes `max_clarification_turns=1`.
 
 ## Things already tried — don't redo them
 
