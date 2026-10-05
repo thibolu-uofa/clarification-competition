@@ -2,51 +2,37 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""Curiosity by Design.
+"""Curiosity by Design - frozen baseline (BasicCuriosity).
 
-Finds what a task leaves open by differential testing, and asks about that rather than
-guessing. The idea is that an underspecified requirement shows itself as a disagreement
-between independent readings of the same task: if two correct-looking implementations of the
-same prompt behave differently on some input, the prompt did not decide what that input
-should do, and that is worth one question.
+FROZEN. This is the exact algorithm that scored TDS 0.6161 / Pass@1 64.16% / nDCG 0.8675 on
+the 770-example validation split on 2026-10-05, 2nd of six on the public leaderboard. It is
+kept loadable so later versions can be A/B'd against it without a checkout; the same bytes
+are tagged `baseline-val-0.6161`.
 
-How it works, per task:
+It is the fallback submission. To fall back, copy this file over `curiosity_by_design.py` and
+restore the class name to `CuriosityByDesign`, so the reported numbers describe the submitted
+file. Do not change anything here: the moment it differs behaviourally, those numbers stop
+describing it.
 
-1. Sample several candidate implementations of the prompt, each written for a different
-   stated user persona, so the readings differ for reasons other than sampling temperature.
-2. Ask the model for test inputs, then reconcile them against the candidates' real
-   signatures - an input that fits no signature is rewritten where it only makes sense as a
-   single argument, and dropped otherwise.
-3. Execute every candidate on every input inside one `env.exec_code` call, recording the
-   return value, exception, non-termination, argument mutation and anything printed.
-4. Group the candidates by the behaviour observed across those inputs. A candidate that
-   crashes on an input the others handle is a bug, not a reading, and is discarded while any
-   clean candidate survives; an input that every candidate rejects says more about the input
-   than about the task and is excluded from the comparison.
-5. If every candidate agrees, widen the search once with inputs aimed further towards the
-   boundaries before concluding that the prompt is unambiguous.
 
-When it asks: whenever a budgeted question is available - on a disagreement, the input that
-splits the candidates most evenly becomes a question about the behaviour behind it, drafted
-per difference, and the draft that best fits the judging criteria (one specific requirement,
-answerable, not about implementation details or tests) is the one asked. When the candidates
-agree, one question is still asked, drafted from the prompt alone, because a prompt that
-several independent readings happen to agree on can still be underspecified.
-
-How it decides: the answer is folded into the specification and the candidates are
-regenerated from it without personas, since the point is now agreement rather than
-diversity. Those are executed and grouped again, and the winner is the largest group of
-candidates that fail no valid input. The final program is repaired once if it still crashes
-on an input, and the unrepaired version is kept unless the repair is strictly better.
-
-Degradation: `env.exec_code` needs Docker. Where it is unavailable, or the sandbox returns
-nothing usable, `run` falls back to asking the model directly for the most critical question
-about the prompt, so a result still comes back without an execution environment.
+Finds what a task leaves open by differential testing. Several candidate
+programs are sampled for the same task and executed on generated inputs. An
+input on which the candidates disagree points at an underspecified requirement
+and is turned into one clarifying question about the behaviour behind it. The
+final implementation is generated from the problem and the user's answer.
 
 Team: Curiosity by Design
 Team Members: Thibaud
 Main Contact: lutellie@ualberta.ca
 """
+
+# STATUS: basic implementation of steps 1-7. Every step runs end to end; the TODOs mark the
+# refinements from the plan that are not implemented yet (coverage-guided input generation,
+# input shrinking, branch traces, mutation testing, structured logging).
+#
+# Degradation: `env.exec_code` needs Docker. When it is unavailable or the sandbox returns
+# nothing usable, `run` falls back to asking the model directly for the most critical
+# question (step 6b), so the algorithm still produces a result without Docker.
 
 from __future__ import annotations
 
@@ -376,7 +362,7 @@ print(END)
 """
 
 
-class CuriosityByDesign(ClarificationAlgorithmBase):
+class BasicCuriosity(ClarificationAlgorithmBase):
     DEFAULT_CONFIG = {
         "num_candidates": 4,  # candidate programs sampled per task
         "use_personas": True,  # vary the persona per candidate; False = same prompt for all
@@ -448,6 +434,9 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
         if not entry_point:
             return True
 
+        # TODO: some benchmark prompts name the function `candidate`. A candidate that defines
+        # only that alias is currently discarded; renaming it to the entry point would recover
+        # it. Also consider nested or conditionally defined functions.
         for node in self.module_level_nodes(tree):
             if (
                 isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -597,9 +586,9 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
     ) -> list[dict[str, Any]]:
         """Returns up to `num_candidates` implementations, each with the persona it was written for.
 
-        The persona is there to make the readings differ for a reason other than sampling
-        temperature. It is not the only source of diversity: most behaviour splits cut across
-        persona boundaries, so `use_personas` can be turned off without the search collapsing.
+        TODO (plan): measure the effect of personas on the train split by comparing how often
+        the candidates split into more than one behaviour group with `--use_personas True`
+        against `False`, and extend USER_PERSONAS with the variants that help.
         """
         base_prompt = CODE_TEMPLATE.replace("{entry_point}", problem["entry_point"]).replace(
             "{prompt}", problem["prompt"].strip()
@@ -630,10 +619,16 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
     ) -> list[str]:
         """Returns argument tuples as literal source strings, to be evaluated in the sandbox.
 
-        One model call asking for varied and edge-case inputs. Nothing here trusts them: the
-        candidates' own signatures reconcile the argument counts afterwards (`resolved_inputs`),
-        and an input that every candidate rejects is excluded from the behaviour comparison
-        rather than allowed to manufacture a difference.
+        This is Option A of the plan: one model call asking for varied and edge-case inputs.
+
+        TODO (plan, Option B): derive the inputs from the candidates instead of asking for
+        them. Collect the conditions and compared constants with `ast`, use those constants
+        and their neighbours (c - 1, c, c + 1, empty and one-element containers) as partition
+        boundaries, mutate seed calls with them, and keep one input per distinct branch
+        signature recorded in the sandbox. Ask once for an `is_valid(*args) -> bool` input
+        specification and filter the sampled inputs with it, so a difference never rests on
+        an input the task considers invalid. Treat a disagreement between the candidates about
+        the number or types of the arguments as a question candidate in its own right.
         """
         prompt = (
             INPUT_TEMPLATE.replace("{entry_point}", problem["entry_point"])
@@ -658,10 +653,9 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
             if not line or line.startswith("#"):
                 continue
 
-            # A bare `(1, 2)` is ambiguous between a two-argument call and a single tuple
-            # argument, and the sandbox reads it as two arguments. It is not resolved here,
-            # where no candidate is in scope: `resolved_inputs` reconciles every line against
-            # the candidates' real signatures and rewrites or drops it there.
+            # TODO: a bare `(1, 2)` is ambiguous between a two-argument call and a single
+            # tuple argument; the sandbox reads it as two arguments. Resolve it against the
+            # candidates' own signatures (visible with `ast`) instead of by convention.
             try:
                 ast.literal_eval(line)
             except (ValueError, SyntaxError):
@@ -976,6 +970,11 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
         One sandbox script for the whole table, since each `env.exec_code` call starts its own
         Docker container. Returns None when Docker is missing or the output is unusable, which
         makes `run` take the no-execution path.
+
+        TODO (plan): also record each candidate's own branch decisions per input. That gives
+        the coverage signal step 6 needs to tell "inputs too weak" from "candidates share one
+        reading", lets step 5 keep one input per distinct branch signature, and supplies the
+        per-program traces that make a difference easier to explain.
         """
         if not candidates or not inputs:
             return None
@@ -1038,11 +1037,11 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
         The strict rule can empty the pool, and `run` must always return something, so it
         falls back to the old rule (ran at least once) and then to nothing.
 
-        Discarding a crashing candidate does lose real information: "raise ValueError on an
-        empty input" versus "return 0" is a genuine open requirement. It is dropped anyway
-        because the final program cannot afford to raise on a test input - the harness
-        compares return values, so any exception fails the task - and a difference that cannot
-        be acted on is not worth spending the single question on.
+        TODO (plan): "raise ValueError on empty input" versus "return 0" is a real open
+        requirement, and discarding the raising candidate loses it. That difference is only
+        worth keeping if the final program never raises on a test input, which it cannot
+        afford to (`TEST_TRIGGER` compares return values, so any exception fails the task).
+        Revisit if a question-only variant of the signature proves worth the complexity.
         """
         if not outputs:
             return []
@@ -1126,7 +1125,13 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
         groups: list[list[int]],
         indices: list[int],
     ) -> list[str]:
-        """Drafts one question per difference, skipping differences the task already decides."""
+        """Drafts one question per difference, skipping differences the task already decides.
+
+        TODO (plan): shrink the input before showing it (smaller lists, numbers and strings
+        while the split holds), and show two or three inputs with the same split so the model
+        can see the rule rather than the instance. Add each program's own branch decisions on
+        the input once step 3 records them.
+        """
         questions: list[str] = []
 
         for input_index in indices:
@@ -1282,10 +1287,13 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
     ) -> tuple[list[dict[str, Any]], list[str]]:
         """Returns extended (candidates, inputs) after the candidates all agreed.
 
-        Agreement has two causes that look identical from the outside: the inputs were too
-        weak to separate the candidates, or the candidates really do share one reading. Since
-        nothing here can tell them apart, both are addressed at once - more edge-case inputs,
-        and one candidate asked to read the task differently.
+        Basic version: ask for more edge-case inputs AND for one candidate that reads the task
+        differently, since without branch coverage there is no way to tell which of the two
+        causes of agreement applies.
+
+        TODO (plan): use the branch coverage from step 3 to choose. Branches not yet taken ->
+        only add inputs aimed at those branches. All branches taken -> only add the divergent
+        candidate, because more inputs cannot help.
         """
         hint = (
             "The following inputs did not separate several implementations of this task, so "
@@ -1317,10 +1325,9 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
     def fallback_question(self, env: ClarificationEnvironment, problem: dict[str, Any]) -> str:
         """Returns the most critical question when no input separates the candidates.
 
-        One question discounts that task's score by about 4%, so asking here is only worth it
-        where the answer is more likely than that to change the outcome. `ask_when_agree`
-        controls whether this path asks at all; it is on because a prompt that several
-        independent readings agree on can still be underspecified.
+        TODO (plan): a question costs 4% of the score for that task, so asking only pays off
+        when `pass_rate_with x 0.96 > pass_rate_without`. Measure both on the train split for
+        the tasks that reach this path and set `ask_when_agree` from the result.
         """
         prompt = FALLBACK_TEMPLATE.replace("{prompt}", problem["prompt"].strip())
 
@@ -1459,6 +1466,9 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
 
         Repeats steps 1-4 with the answers stated as part of the specification. No second
         question: the budget is spent, so remaining disagreement is settled by the vote.
+
+        TODO (plan): break a tie between equally large groups with one model call asking which
+        group matches the answer, instead of taking the first.
         """
         rendered = "\n".join(
             f"- Q: {question}\n  A: {answer}" for question, answer in clarifications
@@ -1601,8 +1611,8 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
             # How many candidates failed on each input. An input that EVERY candidate
             # rejects says more about the input than about the candidates: independently
             # sampled programs rarely share a defect, but they do share a misreading of a
-            # malformed call. `suspect_inputs` excludes those from the comparison; the counts
-            # are recorded here so the size of the effect stays visible in the trace.
+            # malformed call (see the arity TODO in `parse_input_lines`). Recorded so the
+            # size of that effect can be measured before any input partitioning is built.
             width = min(len(row) for row in outputs) if outputs else 0
             per_input = [
                 sum(1 for row in outputs if row[index].get("kind") in ("error", "timeout"))
@@ -1663,8 +1673,8 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
             else:
                 self.trace_note("answer_rejected", True)
 
-            # One question per task: the evaluation setting fixes the clarification budget at
-            # a single turn, so there is no second difference to fold in.
+            # TODO: with a budget above one question, draft the next question from the
+            # differences that remain after folding in this answer rather than stopping here.
             question = ""
 
         if not clarifications:
