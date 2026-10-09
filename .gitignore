@@ -226,3 +226,7 @@ data/splits/smoke_*.txt
 # Result files. CONTRIBUTING.md: "Do not commit result files to the repository."
 data/curiosity_*.jsonl
 data/*_clarify_output*.jsonl
+
+# Local IDE and MCP configuration
+.idea/
+.mcp.json

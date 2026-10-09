@@ -4,14 +4,19 @@ Competition entry. We implement one clarification algorithm as a single file and
 as a PR to the upstream repo. Everything else here is local scaffolding.
 
 - **Our submission:** `clarify/algorithms/curiosity_by_design.py` (class `CuriosityByDesign`)
-- **Design doc / plan:** `clarify/algorithms/curiosityByDesign_plan.py` (prose in comments)
+- **Design doc / plan:** `notes/curiosity_by_design_plan.py` (prose in comments)
 - **Team:** Curiosity by Design — Thibaud (`lutellie@ualberta.ca`)
+
+**The submission file is proven to be the file that scored val TDS 0.6161** — AST-identical to
+tag `baseline-val-0.6161`, checked with `tools/ast_identity.py`. It carries no dormant code from
+any rejected experiment: everything measured and rejected lives in git history or on a branch, not
+behind a flag in the file a reviewer reads. Re-check after any edit before submitting.
 
 ## Deadlines (from CONTRIBUTING.md; AoE 23:59)
 
 | | |
 |---|---|
-| **Oct 9, 2026** | **Registration — a PR must be open.** A draft with a stub file is enough. Not done yet: `origin` is only the fork `thibolu-uofa/clarification-competition`, and no PR is open against `serval-uni-lu/clarification-competition`. |
+| **Oct 9, 2026** | **Registration — a PR must be open.** Branch `submission/curiosity-by-design` is cut from upstream `66bc192` and holds the one algorithm file; see "Registration PR". |
 | Nov 6, 2026 | Submission deadline; commits after it are ignored. The algorithm can keep changing until then. |
 | Nov 20, 2026 | Final results, after the organizers run every merged system on the hidden test set. |
 
@@ -218,8 +223,11 @@ sites. Our 13.7 calls/task buy a lower number.
 
 Measured once, with `overrides: (defaults)`, on the full 770-example val split. 770/770 rows,
 zero exceptions, zero not-ok tasks, `docs/data/leaderboard.csv` untouched. The exact file is
-tagged **`baseline-val-0.6161`** and kept loadable as `clarify/algorithms/basic_curiosity.py`
-(class `BasicCuriosity`), which is the fallback submission.
+tagged **`baseline-val-0.6161`**, and it is what `clarify/algorithms/curiosity_by_design.py` now
+contains. (The copy once kept as `basic_curiosity.py` was deleted on 2026-10-09 — once the
+submission file was restored to the baseline the two were the same program under two names, and a
+second `ClarificationAlgorithmBase` subclass in the tree is a trap, not a safety net. The tag is
+the fallback.)
 
 | | |
 |---|---|
@@ -259,7 +267,8 @@ Tags are terse and were chosen badly; this is the glossary until they are rename
 | `base`, `repair` | early 160-example runs, pre-partition and +crash-repair |
 | `abl_*` | ablation arms at n=160, one config knob each (`abl_nopart` = `--partition_inputs False`) |
 | `base800_direct`, `base800_okanagan` | SDK baselines on our 815-example train sample |
-| `cbd_val` | the one-shot val run above: current algorithm, 770 examples |
+| `cbd_val` | the one-shot val run above: the submitted algorithm, 770 examples, TDS 0.6161 |
+| `synth_val` | the synthesis arm on val, 770 examples, TDS 0.5899 — rejected |
 | `ratelimited_arms/` | four arms that measured the rate limiter, kept as evidence; see the concurrency note |
 
 ## Known SDK bugs and gotchas (not ours; work around them)
@@ -363,8 +372,9 @@ n — the next ≥800-example run should test a different change, not re-measure
 The submission file carries no TODOs - a reviewer reads it first. Each item below keeps its
 measured ceiling so the next change is chosen on evidence rather than on which TODO was nearest.
 
-1. ~~Adjudicate a split vote with the clarification answer~~ — **built, measured, turned off.**
-   See "Things already tried". The code is still in the file behind `adjudicate_vote="never"`.
+1. ~~Adjudicate a split vote with the clarification answer~~ — **built, measured, rejected.**
+   See "Things already tried". The code was removed from the submission file on 2026-10-09; read
+   it back with `git show 92407fa:clarify/algorithms/curiosity_by_design.py`.
 2. **Per-input branch traces** (`run_candidates` / `SANDBOX_SCRIPT`). Instrument each candidate
    with `ast.NodeTransformer` so the sandbox records which conditions each input took. Enables 3
    and 4, and separates "inputs too weak" from "candidates share one reading" - today both look
@@ -419,8 +429,58 @@ and the official setting fixes `max_clarification_turns=1`.
   split-vote tasks could be lifted to unanimous-level performance was never real — it was a
   selection effect, flagged at the time and then under-weighted anyway. Treat every
   "if slice X behaved like slice Y" ceiling in this file the same way.
-  `adjudicate_vote` is left at `"never"`; `tools/dormant_check.py` proves the code cannot
-  affect the returned program at that setting, so the val 0.6161 still describes the file.
+  The code was first left in the file behind `adjudicate_vote="never"` and was removed entirely on
+  2026-10-09, when the file was restored to the 0.6161 baseline for submission.
+
+- **Synthesising one final program from every candidate: −2.73pp on val, the clearest negative of
+  the four.** The design was the right shape for the problem — 59.4% of tasks have *no* correct
+  candidate, so selection cannot help them and only generation can. Hand the model the whole
+  dossier (original specification, the question and its answer, every round-1 and round-2 candidate
+  with its observed behaviour table) and ask for one final program, framed so the attempts read as
+  evidence rather than answers: "most of them are wrong ... a majority among them carries no
+  weight". Bundled with pooling round-1 candidates into the final vote, revising candidates against
+  the answer, and preferring a revised program within its group.
+
+  | | baseline | synthesis |
+  |---|---|---|
+  | TDS | **0.6161** | 0.5899 |
+  | Pass@1 | **64.16%** | 61.43% |
+  | nDCG | 0.8675 | **0.8831** |
+
+  Paired on 770 val examples: **−2.73pp, 54 gained / 75 lost.** The mechanism was not broken —
+  synthesis produced on 762/770, the sandbox veto rejected 43, so it was used on 719 (93.4%) — and
+  it agreed with the vote winner on 85.5% of tasks, so the 14.5% where it departed carry the entire
+  effect. Cost rose to $0.0088/task from $0.0069 (18.8 calls/task against 13.8). Damage concentrated
+  in **HumanEval, 72.86% → 68.00%**, our strongest half; the unambiguous control slice is identical
+  at 73.63% both ways, which is the sanity check. The train counterfactual — both programs logged
+  from the *same* generation, so no resampling noise at all — had already read the same direction
+  (vote 38.77% vs synthesis 37.53%, 810 pairs). Kept on branch `experiment/synthesis-arm`.
+
+  **Two lessons.** First, nDCG moved *up* while Pass@1 moved down: the synthesis only rewrites the
+  final program, so that is resampling on the question side, and a metric that moves where no
+  treatment was applied is noise, not evidence. Second, a prediction from the mechanism — "val has
+  more correct candidates for a reviewer to recognise, so synthesis should transfer better than on
+  train" — was reasonable, agreed by both of us, and **wrong in the measured direction**. Mechanism
+  stories are hypotheses to test, never grounds to skip the measurement.
+
+### Measurements worth more than any of the four changes (2026-10-08/09)
+
+- **Input pair separation is 79.6%, not 21.3%.** The earlier figure measured *crash detection* and
+  was mislabelled as discriminating power; three arguments were built on it before the user caught
+  it. Our inputs separate four right/wrong program pairs in five.
+- **Selection headroom is only +1.99pp, and ~75% of it is blocked by input blindness.** Final round:
+  37 tasks have both a passing and a failing candidate; on 21 of those every candidate looks
+  identical to us; we return a failing program though one passed on **16 tasks (1.99pp)**, of which
+  **12 are blocked by one visible behaviour** and 4 are ranking mistakes. So input work is real but
+  capped near **1.5pp** — and the mutation score says 41% of small semantic changes already slip
+  past ~19 inputs. Measure any input change against those 12 tasks, never against aggregate Pass@1.
+- **The churn floor: 62 discordant tasks out of 679 with zero treatment.** Two runs of the *same*
+  config disagree on ~9% of tasks. Any arm whose discordant count is near 62 has done nothing,
+  whatever its net reads. This is the number that makes most single-arm results unreadable.
+- **59.4% of tasks have no correct candidate at all**, and on 84.8% of unsolved tasks every
+  candidate agrees on one wrong behaviour. Failures are 65.2% wrong output / 34.5% crashes.
+  Generation, not selection, is the binding constraint — but the two generation-side changes tried
+  so far (revision, synthesis) both lost.
 
 - **Crash-repair alone: no effect.** Cut input failures 317 → 104 but Pass@1 moved +1 task of
   160. Paired view: 9 gained, 8 lost, repair implicated in 1. Crash-freeness on generated
@@ -431,6 +491,38 @@ and the official setting fixes `max_clarification_turns=1`.
 - **14.3% of generated inputs are rejected by every candidate**, and 67 of 815 tasks have
   essentially no usable inputs. Of those, only ~43% are arity mismatches — and the common
   direction is too *few* arguments (unfixable by rewrapping), not too many.
+
+## Registration PR (prepared 2026-10-09)
+
+Branch **`submission/curiosity-by-design`**, cut from upstream `66bc192` so it carries no local
+scaffolding, containing exactly one file: `clarify/algorithms/curiosity_by_design.py`.
+
+Everything else in this repo is deliberately *not* in it — `CLAUDE.md`, `tests/`, `notes/`,
+`tools/`, `runs/` and our `.gitignore` additions are local and would be noise in a review. Verify
+with `git diff --name-only 66bc192 submission/curiosity-by-design`: it must print one path.
+
+The PR body is reproduced in `notes/pr_body.md`. The leaderboard row is **not** touched — the
+"No leaderboard change" box is ticked, `docs/data/leaderboard.csv` is untouched, and the val
+numbers go in the body as prose. Adding a row is a separate PR once the organizers confirm the
+result, and editing that file would make the diff look like a score claim we cannot verify.
+
+Certification: "developed on the released splits only and did not tune on validation instances."
+The honest version of why this holds, stated plainly because it is the one claim in the PR we might
+be asked to defend:
+
+- **The shipped configuration predates every val run.** `DEFAULT_CONFIG` was fixed on train, and
+  the first val run measured that already-frozen file. Nothing in the shipped file was chosen by a
+  val comparison, because there was no val number to choose by when it was chosen.
+- Val was run twice, both times to *measure* a finished configuration, which CONTRIBUTING.md Step 4
+  sanctions and the public leaderboard is built on.
+- **The uncomfortable part, recorded rather than glossed:** the synthesis arm was rejected after a
+  val run, and had it improved on val we would have shipped it — that would have been val
+  selection. What keeps the decision clean is that train evidence pointed the same way *first* (the
+  paired counterfactual, no resampling noise, vote 38.77% vs synthesis 37.53%), so val confirmed a
+  conclusion it did not produce. Thin, and it only holds because the answer was negative.
+- **The rule going forward, which is cheap to keep:** decide on train, then run val once to report.
+  One val run per configuration, and never two configurations compared on val. We have now spent
+  two of those runs; a third that picks between arms would void the certification.
 
 ## Conventions
 

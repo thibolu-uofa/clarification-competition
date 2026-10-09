@@ -64,7 +64,31 @@ from clarify.env import (
     LimitsExceededException,
     TooManyQuestionException,
 )
-from clarify.runtime import _validate_and_parse_evalplus_result
+
+
+def parse_fenced_code(result):
+    """Extracts the single ```python block a code request asks for.
+
+    This duplicates `clarify.runtime`'s own parser rather than importing it. That helper is
+    private, and a submission that reaches into the harness for a private name breaks the
+    moment the harness is refactored - at which point every task fails to import rather than
+    failing gracefully. Ten lines of string splitting are cheaper than that risk.
+
+    The message is part of the contract, not decoration: `ask_for_code` feeds it back to the
+    model as the correction prompt when a response arrives unfenced, so it has to read as an
+    instruction.
+    """
+    if "```python" not in result:
+        raise ValueError("Expected the result to be enclosed in ```python and ```")
+
+    _, result = result.split("```python", 1)
+
+    if "```" not in result:
+        raise ValueError("Expected the result to be enclosed in ```python and ```")
+
+    result, _ = result.split("```", 1)
+    return result
+
 
 # One JSON record per task, for analysis on the train split. Silent unless a handler is
 # attached, and nothing here opens a file: a personal runner script attaches the handler and
@@ -110,26 +134,6 @@ Rules:
 - A single-argument call is written as a one-element tuple, e.g. `([1, 2, 3],)`.
 - Use Python literals only: no variables, no function calls, no comments.
 - Every input must be one the task considers valid.
-""".strip()
-
-ADJUDICATE_TEMPLATE = """
-Several implementations of the same task were written after the author answered a question
-about it, and they do not all behave the same way. Decide which behaviour the author asked for.
-
-### Task
-{prompt}
-
-### What the author said
-{clarifications}
-
-### Candidate behaviours
-{behaviours}
-
-The author's answer takes precedence over the problem text, including over its examples. If it
-does not decide between the behaviours, choose the one that best fits the task description.
-
-Reply with one line and nothing else, in this exact form:
-CHOICE=<number of the behaviour>
 """.strip()
 
 DIFFERENCE_TEMPLATE = """
@@ -409,15 +413,6 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
         "partition_inputs": True,  # separate informative inputs from malformed/rejected ones
         "input_retries": 1,  # re-ask for inputs when most do not fit the candidate signature
         "repair_attempts": 1,  # repair rounds for the final program when it fails on inputs
-        # Which post-clarification disagreements to settle with a model call rather than by
-        # counting votes: "never" (plain majority), "ties" (only equally large groups), or
-        # "split" (any surviving disagreement). Measured on 815 train examples and turned
-        # OFF: the call fired on 12.8% of tasks and overruled the majority on 29.8% of
-        # those, but on the 27 tasks it overruled, Pass@1 went from 7.4% to 0.0% - not one
-        # passed. A split vote marks a task nobody solves rather than a choice made wrongly,
-        # so the majority is left to decide and the question's answer is used only to
-        # regenerate. Kept here because the measurement is worth more than the code.
-        "adjudicate_vote": "never",
         "exec_timeout": 2.0,  # seconds allowed per candidate call inside the sandbox
         "float_tol": 1e-9,  # rounding applied to floats before comparing behaviour
     }
@@ -437,7 +432,7 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
         for attempt in range(max(self.config["generation_attempts"], 1)):
             response = self.ask_model(env, messages)
             try:
-                code = _validate_and_parse_evalplus_result(response)
+                code = parse_fenced_code(response)
             except ValueError as error:
                 messages += [
                     {"role": "assistant", "content": response},
@@ -578,12 +573,6 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
             "answer": "",
             "vote_sizes": [],
             "final_vote_shape": "none",
-            # Defaulted so that "the adjudication never ran" and "the field is missing" are
-            # different states in the trace; analysis of a config change depends on it.
-            "adjudicate_groups": [],
-            "adjudicated": False,
-            "adjudicate_choice": -1,
-            "adjudicate_agreed_with_majority": False,
             "final_failures": 0,
             "final_failures_after": 0,
             "repairs_accepted": 0,
@@ -1482,102 +1471,6 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
         self.trace_note("final_failures_after", len(current_failures))
         return current_code
 
-    def adjudication_needed(
-        self, groups: list[list[int]], outputs: list[list[dict[str, Any]]], valid: list[int]
-    ) -> bool:
-        """Whether `adjudicate_vote` says to settle this disagreement with a model call.
-
-        `groups` must already be sorted the way `final_program` sorts them, so a tie is an
-        equal failure count AND an equal size between the first two.
-        """
-        scope = self.config["adjudicate_vote"]
-        if scope == "never" or len(groups) < 2:
-            return False
-        if scope == "ties":
-            first, second = groups[0], groups[1]
-            return len(first) == len(second) and self.failures_on_valid(
-                outputs[first[0]], valid
-            ) == self.failures_on_valid(outputs[second[0]], valid)
-        return scope == "split"
-
-    def render_behaviours(
-        self,
-        outputs: list[list[dict[str, Any]]],
-        groups: list[list[int]],
-        indices: list[int],
-        total: int,
-    ) -> str:
-        """One numbered block per group, showing what it does on the distinguishing inputs.
-
-        Rendered through `call_repr` and `describe` so the calls and values are Python syntax;
-        a prompt that has to make behaviours comparable cannot afford `true` or `[["int", 1]]`.
-        """
-        blocks = []
-        for number, group in enumerate(groups, start=1):
-            lines = [f"Behaviour {number} ({len(group)} of {total} implementations):"]
-            for input_index in indices:
-                call = self.call_repr(outputs, input_index)
-                lines.append(f"- `{call}` {self.describe(outputs[group[0]][input_index])}")
-            blocks.append("\n".join(lines))
-        return "\n\n".join(blocks)
-
-    def parse_choice(self, reply: str, num_groups: int) -> int | None:
-        """The 0-based group index named by `CHOICE=<n>`, or None if the reply is unusable.
-
-        A reply that names no number, or one out of range, means the model did not answer the
-        question asked; the caller then keeps the majority rather than guessing.
-        """
-        raw = self.field(reply, "CHOICE")
-        digits = re.search(r"\d+", raw or "")
-        if not digits:
-            return None
-        number = int(digits.group(0))
-        if 1 <= number <= num_groups:
-            return number - 1
-        return None
-
-    def adjudicate(
-        self,
-        env: ClarificationEnvironment,
-        problem: dict[str, Any],
-        clarifications: list[tuple[str, str]],
-        outputs: list[list[dict[str, Any]]],
-        groups: list[list[int]],
-        valid: list[int],
-        total: int,
-    ) -> int | None:
-        """Asks which group's behaviour matches the author's answer; None to keep the majority.
-
-        The answer was already paid for with the task's one question, and counting votes
-        throws it away: on the validation split the tasks whose vote splits pass 38.74%
-        against 70.90% when it is unanimous. Every failure path here falls back to the
-        majority, so this can only change which of several surviving groups is chosen.
-        """
-        if not clarifications:
-            return None
-
-        indices = self.pick_distinguishing_inputs(outputs, groups)
-        if not indices:
-            # The groups differ only where the comparison is not trustworthy, so there is
-            # nothing legible to show and nothing to decide.
-            return None
-
-        rendered = "\n".join(
-            f"- Q: {question}\n  A: {answer}" for question, answer in clarifications
-        )
-        prompt = (
-            ADJUDICATE_TEMPLATE.replace("{prompt}", problem["prompt"].strip())
-            .replace("{clarifications}", rendered)
-            .replace("{behaviours}", self.render_behaviours(outputs, groups, indices, total))
-        )
-
-        try:
-            reply = self.ask_model(env, prompt)
-        except LimitsExceededException:
-            return None
-
-        return self.parse_choice(reply, len(groups))
-
     def final_program(
         self,
         env: ClarificationEnvironment,
@@ -1641,19 +1534,6 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
                 key=lambda group: (self.failures_on_valid(outputs[group[0]], valid), -len(group)),
             )
             chosen = groups[0][0]
-
-            # The majority counts candidates; it does not read the answer the question was
-            # spent on. Where the vote is split, ask which behaviour the author described.
-            self.trace_note("adjudicate_groups", [len(group) for group in groups])
-            if self.adjudication_needed(groups, outputs, valid):
-                picked = self.adjudicate(
-                    env, problem, clarifications, outputs, groups, valid, len(candidates)
-                )
-                self.trace_note("adjudicated", picked is not None)
-                if picked is not None:
-                    self.trace_note("adjudicate_choice", picked)
-                    self.trace_note("adjudicate_agreed_with_majority", picked == 0)
-                    chosen = groups[picked][0]
         else:
             # Every program is broken; repair below is the only remaining lever.
             chosen = 0
@@ -1847,7 +1727,7 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
             return ""
 
         try:
-            return _validate_and_parse_evalplus_result(response)
+            return parse_fenced_code(response)
         except ValueError:
             # Prose is not a solution: `evaluate_responses` wraps the text in a python
             # fence and compiles it, so returning it guarantees a syntax error and a
