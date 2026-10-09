@@ -96,9 +96,9 @@ Generation was sharded ten ways over the val split purely for wall-clock reasons
 | --- | --- | --- | --- | --- | --- |
 | 0.6161 | 0.8675 | 64.16% | 99.87% | 100.00% | 0.0069 |
 
-770/770 tasks produced a row, with no exceptions and no task falling back to an empty program. High-quality clarification rate 86.87%. Breakdown, for whatever it is worth to a reviewer: HumanEval 72.86% (n=350) against MBPP 56.90% (n=420); prompts with no hidden ambiguity 73.63% (n=91) against ambiguous prompts 62.89% (n=679).
+770/770 tasks produced a row, with no exceptions raised and no task recorded as not-ok in our own trace. High-quality clarification rate 86.87%. Breakdown, for whatever it is worth to a reviewer: HumanEval 72.86% (n=350) against MBPP 56.90% (n=420); prompts with no hidden ambiguity 73.63% (n=91) against ambiguous prompts 62.89% (n=679).
 
-The over-asking rate is 100% by construction: `ask_when_agree=True` means a question is asked even when the candidates agree, and one question costs roughly 4% of the task's score under TDS. We measured the alternative and kept asking, because the pass-rate gain on prompts that *look* unambiguous but are not exceeded the discount. We would rather be told this is the wrong trade than hide it.
+The over-asking rate is 100% by construction: `ask_when_agree=True` means a question is asked even when the candidates agree, and one question costs roughly 4% of the task's score under TDS. To be straight about it, **we have not measured the alternative** — the `ask_when_agree=False` arm was started and abandoned, so asking unconditionally is a design choice we have not yet earned the right to defend with numbers. The reasoning is that candidates agreeing is weak evidence of an unambiguous prompt (they can share one misreading), and on our train sample prompts with no hidden ambiguity still pass only ~45%, which is also where an algorithm that never asks lands. Measuring it is the first thing on our list before the November deadline.
 
 **Generation / result files:** available on request — happy to attach them to a release or a gist if that is useful for reproduction. Not committed, per CONTRIBUTING.md.
 
