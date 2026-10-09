@@ -480,6 +480,212 @@ def test_adjudication_keeps_the_majority_on_an_unusable_reply():
         assert picked is None, reply
 
 
+# --- keeping the pre-answer candidates: revision and the pooled vote ---------------------
+
+
+def pooled(*origins):
+    """Candidates distinguished only by origin, for the ranking tests."""
+    return [{"code": f"def f(): return {i}", "persona": "", "origin": o}
+            for i, o in enumerate(origins)]
+
+
+@check
+def test_one_representative_per_behaviour_group():
+    """Revising two members of one group pays twice for the same reading."""
+    algorithm = fresh()
+    groups = [[0, 1, 2], [3], [4]]
+    assert algorithm.group_representatives(groups, 2) == [0, 3]
+    assert algorithm.group_representatives(groups, 1) == [0]
+    assert algorithm.group_representatives(groups, 9) == [0, 3, 4]
+    assert algorithm.group_representatives(groups, 0) == []
+    assert algorithm.group_representatives([], 2) == []
+
+
+@check
+def test_revise_prompt_carries_the_answer_and_the_old_program():
+    algorithm = fresh()
+    env = _StubEnv("```python\ndef f(a):\n    return sorted(a, reverse=True)\n```")
+    out = algorithm.revise_program(
+        env, {"prompt": "sort the values", "entry_point": "f"},
+        "def f(a):\n    return sorted(a)\n", [("Which order?", "Descending.")],
+    )
+    assert out and "reverse=True" in out
+    # `ask_for_code` wraps the prompt in a messages list, unlike `ask_model`'s plain string.
+    text = "\n".join(m["content"] for m in env.prompts[0])
+    assert "Descending." in text and "return sorted(a)" in text
+
+
+@check
+def test_within_group_preference_never_changes_which_group_wins():
+    """Members of a group are identical on every input, so this is a free choice.
+
+    `always` is the version that overrides the majority; it must stay opt-in.
+    """
+    outputs = [[value(["int", 0])] for _ in range(4)]
+    valid = [0]
+    groups = [[0, 1, 2], [3]]  # majority of three, and a lone revised candidate
+    candidates = pooled("regenerated", "regenerated", "regenerated", "revised")
+
+    within = fresh(prefer_revised="within_group")
+    assert within.rank_groups(groups, outputs, candidates, valid)[0] == [0, 1, 2]
+
+    always = fresh(prefer_revised="always")
+    assert always.rank_groups(groups, outputs, candidates, valid)[0] == [3]
+
+    never = fresh(prefer_revised="never")
+    assert never.rank_groups(groups, outputs, candidates, valid)[0] == [0, 1, 2]
+
+
+@check
+def test_the_revised_member_of_the_winning_group_is_returned():
+    candidates = pooled("round1", "revised", "regenerated")
+    group = [0, 1, 2]
+    assert fresh(prefer_revised="within_group").pick_from_group(group, candidates) == 1
+    assert fresh(prefer_revised="always").pick_from_group(group, candidates) == 1
+    # "never" keeps the old rule: whichever was sampled first.
+    assert fresh(prefer_revised="never").pick_from_group(group, candidates) == 0
+    # No revision in the group: the first member, under every setting.
+    plain = pooled("round1", "regenerated")
+    for scope in ("within_group", "always", "never"):
+        assert fresh(prefer_revised=scope).pick_from_group([0, 1], plain) == 0
+
+
+@check
+def test_failures_still_outrank_provenance():
+    """A revised candidate that fails a valid input must not win on provenance alone."""
+    outputs = [
+        [value(["int", 0]), value(["int", 0])],
+        [value(["int", 1]), error("ValueError")],
+    ]
+    valid = [0, 1]
+    candidates = pooled("regenerated", "revised")
+    for scope in ("within_group", "always"):
+        ranked = fresh(prefer_revised=scope).rank_groups([[0], [1]], outputs, candidates, valid)
+        assert ranked[0] == [0], scope
+
+
+@check
+def test_never_is_exactly_the_old_sort():
+    """`prefer_revised="never"` must be the pre-existing expression, not merely similar.
+
+    The old selection was `sorted(groups, key=(failures_on_valid, -len(group)))` followed by
+    `group[0]`. This replaces an expression on the reachable path, so unlike a flagged-off
+    code path it cannot be proved dormant by comparing ASTs - it is proved by equivalence
+    over randomised shapes instead.
+    """
+    import random
+
+    algorithm = fresh(prefer_revised="never")
+    rng = random.Random(20261005)
+    for _ in range(300):
+        num = rng.randint(1, 6)
+        num_inputs = rng.randint(1, 4)
+        outputs = [
+            [value(["int", rng.randint(0, 2)]) if rng.random() > 0.25 else error()
+             for _ in range(num_inputs)]
+            for _ in range(num)
+        ]
+        indices = list(range(num))
+        rng.shuffle(indices)
+        groups, cut = [], 0
+        while cut < num:
+            size = rng.randint(1, num - cut)
+            groups.append(indices[cut:cut + size])
+            cut += size
+        candidates = [
+            {"code": "", "persona": "", "origin": rng.choice(["round1", "revised", "regenerated"])}
+            for _ in range(num)
+        ]
+        valid = list(range(num_inputs))
+
+        old = sorted(
+            groups,
+            key=lambda g: (algorithm.failures_on_valid(outputs[g[0]], valid), -len(g)),
+        )
+        new = algorithm.rank_groups(groups, outputs, candidates, valid)
+        assert new == old, (groups, new, old)
+        assert algorithm.pick_from_group(new[0], candidates) == old[0][0]
+
+
+# --- synthesising the final program from everything we know ------------------------------
+
+
+@check
+def test_synthesis_prompt_carries_every_piece_of_evidence():
+    """And states that the attempts are mostly wrong - that framing is the point.
+
+    Presented neutrally, four drafts invite the model to return the most popular one, which is
+    the majority vote we already have and which we measured as near-optimal-but-capped. The
+    assertion on the wording is here so a later edit cannot quietly soften it.
+    """
+    algorithm = fresh()
+    algorithm.current_inputs = ["([1, 2],)"]
+    before = [{"code": "def f(a):\n    return sum(a)", "persona": "", "origin": "round1"}]
+    after = [{"code": "def f(a):\n    return max(a)", "persona": "", "origin": "regenerated"},
+             {"code": "def f(a):\n    return min(a)", "persona": "", "origin": "regenerated"}]
+    before_out = [[value(["int", 3])]]
+    after_out = [[value(["int", 2])], [value(["int", 1])]]
+    env = _StubEnv("```python\ndef f(a):\n    return max(a)\n```")
+
+    out = algorithm.synthesise_program(
+        env, {"prompt": "pick a value", "entry_point": "f"},
+        [("Largest or smallest?", "The largest.")],
+        before, after, before_out, after_out, [[0], [1]], [0],
+    )
+    assert out and "max(a)" in out
+    text = "\n".join(m["content"] for m in env.prompts[0])
+
+    # the author's answer, both sets of attempts, and the observed disagreement
+    assert "The largest." in text
+    assert "return sum(a)" in text, "pre-answer attempt missing"
+    assert "return max(a)" in text and "return min(a)" in text, "post-answer attempts missing"
+    assert "returns 2" in text and "returns 1" in text, "observed behaviour missing"
+    # the framing
+    assert "Most of them are wrong" in text
+    assert "carries no weight" in text
+    assert "do not copy one of them" in text.lower()
+
+
+@check
+def test_synthesis_sources_round1_hides_the_earlier_attempts():
+    algorithm = fresh(synthesis_sources="round1")
+    algorithm.current_inputs = ["([1],)"]
+    env = _StubEnv("```python\ndef f(a):\n    return a\n```")
+    algorithm.synthesise_program(
+        env, {"prompt": "p", "entry_point": "f"}, [("q", "a")],
+        [], [{"code": "def f(a):\n    return a", "persona": "", "origin": "x"}],
+        None, [[value(["int", 1])]], [[0]], [0],
+    )
+    text = "\n".join(m["content"] for m in env.prompts[0])
+    assert "(none)" in text or "(not shown)" in text
+
+
+@check
+def test_dossier_reports_a_crash_and_only_the_disagreeing_inputs():
+    algorithm = fresh()
+    algorithm.current_inputs = ["([1],)", "([2],)"]
+    candidates = [{"code": "def f(a):\n    return a", "persona": "", "origin": "x"}]
+    outputs = [[value(["int", 1]), error("ValueError")]]
+    text = algorithm.candidate_dossier(candidates, outputs, [1], [0, 1])
+    assert "fails on 1 of the inputs tried" in text
+    assert "raises ValueError" in text
+    # input 0 was not in the disagreeing set, so it is not shown
+    assert "returns 1" not in text
+
+
+@check
+def test_the_sandbox_stays_the_guard_on_the_synthesis():
+    """Taken on a tie, rejected only when the sandbox positively shows it worse."""
+    unless = fresh(prefer_synthesis="unless_worse")
+    assert unless.use_synthesis(0, 0) is True     # tie: more evidence wins
+    assert unless.use_synthesis(0, 2) is True     # strictly better
+    assert unless.use_synthesis(2, 0) is False    # measurably worse: keep the vote winner
+    always = fresh(prefer_synthesis="always")
+    assert always.use_synthesis(5, 0) is True
+    never = fresh(prefer_synthesis="never")
+    assert never.use_synthesis(0, 5) is False
+
+
 if __name__ == "__main__":
     failures = []
     for test in CHECKS:

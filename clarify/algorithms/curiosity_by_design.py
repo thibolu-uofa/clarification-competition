@@ -201,6 +201,61 @@ Write it in plain prose: no backticks, no code spans, no Markdown. The author mi
 question's formatting in the reply, and a backtick there truncates the answer.
 """.strip()
 
+SYNTHESIS_TEMPLATE = """
+You are the engineer who decides what this function does. Below are several attempts at it,
+written before and after the author clarified the task, with what each one actually did when it
+was executed.
+
+Treat the attempts as evidence, not as answers. Most of them are wrong. They were written from a
+description that did not say enough, so where they agree they are as likely to be sharing one
+misreading as to be right: a majority among them carries no weight. Do not pick one of them and
+do not copy one of them.
+
+### Task as it was originally given
+{prompt}
+
+### What the author said when asked
+{clarifications}
+
+That answer settles the intended behaviour. It overrides the task text, including its examples,
+and it overrides anything the attempts below do.
+
+### Attempts written before the author answered
+{before}
+
+### Attempts written after the author answered
+{after}
+
+### Where the attempts disagree
+{disagreements}
+
+Decide what the author asked for, say in one line which reading is correct and what the attempts
+that disagree with it got wrong, then write the implementation yourself.
+
+Enclose your complete solution in a single block starting with ```python and ending with ```.
+""".strip()
+
+REVISE_TEMPLATE = """
+You wrote the implementation below for this task, before the author clarified it. Revise it so
+that it matches what the author has now said.
+
+{prompt}
+
+### What the author said
+{clarifications}
+
+### Your earlier implementation
+```python
+{code}
+```
+
+The author's answer takes precedence over the problem text, including over its examples. Keep
+everything the earlier implementation already got right and change only what the answer bears
+on. If it already matches the answer, return it unchanged.
+
+Enclose your complete solution in a single block starting with ```python and ending with ```.
+""".strip()
+
 REPAIR_TEMPLATE = """
 The implementation below is meant to solve this task.
 
@@ -418,6 +473,38 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
         # so the majority is left to decide and the question's answer is used only to
         # regenerate. Kept here because the measurement is worth more than the code.
         "adjudicate_vote": "never",
+        # Record every sampled candidate's source in the trace. Off by default and never
+        # needed to solve a task: it exists so a local analysis can ask whether a correct
+        # program was among the candidates at all, which separates "selection chose badly"
+        # from "generation never produced it". Logging only, like the rest of the trace.
+        "trace_candidates": False,
+        # After the answer arrives, the candidates written before it are not thrown away.
+        # `revise_candidates` asks for a revision of one representative per behaviour group,
+        # given the answer and that program; `pool_rounds` keeps the pre-answer candidates in
+        # the final vote. Measured oracle over the union of both pools is 44.3% against 40.6%
+        # for the regenerated candidates alone, which is what these target.
+        "revise_candidates": True,
+        "max_revisions": 2,  # representatives revised per task; each is one model call
+        "pool_rounds": True,
+        # Which candidate to return out of the winning group. Members of a group behave
+        # identically on every generated input, so the sandbox cannot separate them and the
+        # old choice - whichever was sampled first - was arbitrary. "within_group" prefers a
+        # revised member, which cannot change which group wins. "always" lets a group holding
+        # a revision outrank a larger one, which does override the majority. "never" is the
+        # pre-existing behaviour.
+        "prefer_revised": "within_group",
+        # Hand the model everything we know - the task, the author's answer, every candidate
+        # written before and after it, and what the sandbox saw each one do - and ask it to
+        # write the final program itself. This is the one lever that gives the model
+        # information the vote structurally cannot use: it reads the source, where the vote
+        # sees only behaviour on generated inputs, and 20.4% of right/wrong candidate pairs
+        # are indistinguishable on those inputs.
+        "synthesize_final": True,
+        "synthesis_sources": "both",  # "both" or "round1": which attempts the prompt shows
+        # "unless_worse" keeps the vote winner only when the sandbox shows the synthesis is
+        # worse on a valid input; "always" ignores the sandbox; "never" disables the use of
+        # the synthesis while still allowing it to be logged for comparison.
+        "prefer_synthesis": "unless_worse",
         "exec_timeout": 2.0,  # seconds allowed per candidate call inside the sandbox
         "float_tol": 1e-9,  # rounding applied to floats before comparing behaviour
     }
@@ -580,6 +667,16 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
             "final_vote_shape": "none",
             # Defaulted so that "the adjudication never ran" and "the field is missing" are
             # different states in the trace; analysis of a config change depends on it.
+            "revisions_made": 0,
+            "pool_size": {},
+            "pool_groups": [],
+            "winner_origin": "none",
+            "winner_was_revised": False,
+            "synthesis_made": False,
+            "synthesis_used": False,
+            "synthesis_failures": -1,
+            "vote_winner_failures": -1,
+            "synthesis_agreed_with_vote": False,
             "adjudicate_groups": [],
             "adjudicated": False,
             "adjudicate_choice": -1,
@@ -608,6 +705,11 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
     def trace_add(self, key: str, amount: int) -> None:
         if getattr(self, "trace", None) is not None:
             self.trace[key] = self.trace.get(key, 0) + amount
+
+    def trace_programs(self, key: str, candidates: list[dict[str, Any]]) -> None:
+        """Records candidate sources under `key`, only when `trace_candidates` is on."""
+        if self.config["trace_candidates"]:
+            self.trace_note(key, [candidate["code"] for candidate in candidates])
 
     def ask_model(self, env: ClarificationEnvironment, messages: Any) -> str:
         """`env.llm` with a call counter, so a record says how expensive the task was."""
@@ -654,7 +756,7 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
                 break
 
             if code and self.defines_entry_point(code, problem["entry_point"]):
-                candidates.append({"code": code, "persona": persona})
+                candidates.append({"code": code, "persona": persona, "origin": "round1"})
 
         return candidates
 
@@ -1345,7 +1447,9 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
                 code = None
 
             if code and self.defines_entry_point(code, problem["entry_point"]):
-                widened_candidates.append({"code": code, "persona": "divergent reading"})
+                widened_candidates.append(
+                    {"code": code, "persona": "divergent reading", "origin": "round1"}
+                )
 
         return widened_candidates, widened_inputs
 
@@ -1388,6 +1492,179 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
             for index in positions
             if row[index].get("kind") in ("error", "timeout")
         ]
+
+    def group_representatives(self, groups: list[list[int]], limit: int) -> list[int]:
+        """One candidate index per behaviour group, largest group first, at most `limit`.
+
+        Candidates inside a group are identical on every input we have, so revising more than
+        one of them pays repeatedly for the same reading.
+        """
+        ordered = sorted(groups, key=len, reverse=True)
+        return [group[0] for group in ordered[: max(limit, 0)] if group]
+
+    def revise_program(
+        self,
+        env: ClarificationEnvironment,
+        problem: dict[str, Any],
+        code: str,
+        clarifications: list[tuple[str, str]],
+    ) -> str | None:
+        """One revision of a pre-answer program in the light of the answer, or None.
+
+        Unlike `repair_program` this needs no observed failure: four fifths of the candidates
+        that fail the hidden tests run clean on every input we generate, so waiting for a
+        visible crash means never revising the programs that are actually wrong. Nothing is
+        accepted or rejected here - the revision joins the vote as one more candidate, which
+        is what makes it safe to ask for without an oracle.
+        """
+        rendered = "\n".join(
+            f"- Q: {question}\n  A: {answer}" for question, answer in clarifications
+        )
+        prompt = (
+            REVISE_TEMPLATE.replace("{prompt}", problem["prompt"].strip())
+            .replace("{clarifications}", rendered)
+            .replace("{code}", code.strip())
+        )
+        try:
+            return self.ask_for_code(env, prompt, problem["entry_point"])
+        except LimitsExceededException:
+            return None
+
+    def candidate_dossier(
+        self,
+        candidates: list[dict[str, Any]],
+        outputs: list[list[dict[str, Any]]] | None,
+        indices: list[int],
+        valid: list[int],
+        offset: int = 0,
+    ) -> str:
+        """Each candidate's source plus what the sandbox saw it do, for the synthesis prompt.
+
+        Only the inputs where the candidates disagree are shown per program: the behaviour on
+        an input they all agree about says nothing about which of them is right, and the
+        prompt has to stay readable. A crash is called out separately because it is the one
+        observation that marks a program as broken rather than merely different.
+        """
+        if not candidates:
+            return "(none)"
+
+        blocks = []
+        for number, candidate in enumerate(candidates, start=1):
+            lines = [f"#### Attempt {number}", "```python", candidate["code"].strip(), "```"]
+            row = outputs[offset + number - 1] if outputs and offset + number - 1 < len(outputs) else None
+            if row is not None:
+                crashes = self.failures_on_valid(row, valid)
+                if crashes:
+                    lines.append(f"Observed: fails on {crashes} of the inputs tried.")
+                for input_index in indices:
+                    if input_index < len(row):
+                        call = self.call_repr(outputs or [], input_index)
+                        lines.append(f"- `{call}` {self.describe(row[input_index])}")
+            blocks.append("\n".join(lines))
+        return "\n\n".join(blocks)
+
+    def synthesise_program(
+        self,
+        env: ClarificationEnvironment,
+        problem: dict[str, Any],
+        clarifications: list[tuple[str, str]],
+        before: list[dict[str, Any]],
+        after: list[dict[str, Any]],
+        before_outputs: list[list[dict[str, Any]]] | None,
+        after_outputs: list[list[dict[str, Any]]] | None,
+        groups: list[list[int]],
+        valid: list[int],
+    ) -> str | None:
+        """One program written from every piece of evidence we hold, or None.
+
+        The prompt tells the model outright that most of the attempts are wrong and that
+        agreement between them is not evidence. That is measured, not rhetorical: on 59.4% of
+        tasks none of the candidates is correct, and on 84.8% of those every candidate agrees
+        on the same wrong behaviour. Presented neutrally, the attempts would invite the model
+        to return the most popular one, which is the majority vote we already have.
+        """
+        rendered = "\n".join(
+            f"- Q: {question}\n  A: {answer}" for question, answer in clarifications
+        )
+        indices = self.pick_distinguishing_inputs(after_outputs or [], groups) if after_outputs else []
+        disagreements = (
+            self.render_behaviours(after_outputs, groups, indices, len(after))
+            if after_outputs and indices and len(groups) > 1
+            else "The attempts agree on every input tried, which does not mean the task is settled."
+        )
+
+        show_before = self.config["synthesis_sources"] != "none"
+        prompt = (
+            SYNTHESIS_TEMPLATE.replace("{prompt}", problem["prompt"].strip())
+            .replace("{clarifications}", rendered)
+            .replace(
+                "{before}",
+                self.candidate_dossier(before, before_outputs, indices, valid)
+                if show_before else "(not shown)",
+            )
+            .replace("{after}", self.candidate_dossier(after, after_outputs, indices, valid))
+            .replace("{disagreements}", disagreements)
+        )
+
+        try:
+            return self.ask_for_code(env, prompt, problem["entry_point"])
+        except LimitsExceededException:
+            return None
+
+    def use_synthesis(self, synthesis_failures: int, winner_failures: int) -> bool:
+        """Whether to return the synthesised program rather than the vote's winner.
+
+        "unless_worse" is the default because the two checks see different things: the vote
+        reads behaviour on generated inputs and the synthesis reads source, and neither
+        dominates. So the synthesis is taken on a tie - it was built from strictly more
+        evidence - and rejected only where the sandbox positively shows it worse.
+        """
+        scope = self.config["prefer_synthesis"]
+        if scope == "always":
+            return True
+        if scope == "never":
+            return False
+        return synthesis_failures <= winner_failures
+
+    def rank_groups(
+        self,
+        groups: list[list[int]],
+        outputs: list[list[dict[str, Any]]],
+        candidates: list[dict[str, Any]],
+        valid: list[int],
+    ) -> list[list[int]]:
+        """Groups best first: fewest failures on valid inputs, then size.
+
+        With `prefer_revised="always"` a group holding a revised candidate is ranked ahead of a
+        larger one. That overrides the majority, which is the only signal that has ever held up
+        here, so it is not the default.
+        """
+        revised_first = self.config["prefer_revised"] == "always"
+
+        def key(group: list[int]) -> tuple[int, int, int]:
+            has_revised = any(candidates[index].get("origin") == "revised" for index in group)
+            return (
+                self.failures_on_valid(outputs[group[0]], valid),
+                -1 if (revised_first and has_revised) else 0,
+                -len(group),
+            )
+
+        return sorted(groups, key=key)
+
+    def pick_from_group(self, group: list[int], candidates: list[dict[str, Any]]) -> int:
+        """Which member of the winning group to return.
+
+        Every member behaves identically on every generated input, so there is no sandbox
+        signal to choose between them and the old rule - take whichever was sampled first -
+        was arbitrary. Unless `prefer_revised` is "never", prefer a revised candidate: it has
+        had a second pass with the author's answer in hand.
+        """
+        if self.config["prefer_revised"] == "never":
+            return group[0]
+        for index in group:
+            if candidates[index].get("origin") == "revised":
+                return index
+        return group[0]
 
     def repair_program(
         self,
@@ -1585,11 +1862,21 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
         clarifications: list[tuple[str, str]],
         inputs: list[str],
         previous: list[dict[str, Any]],
+        previous_groups: list[list[int]] | None = None,
+        previous_outputs: list[list[dict[str, Any]]] | None = None,
     ) -> str:
-        """Returns the implementation, chosen by majority vote over fresh candidates.
+        """Returns the implementation, chosen by a vote over every candidate we have.
 
         Repeats steps 1-4 with the answers stated as part of the specification. No second
         question: the budget is spent, so remaining disagreement is settled by the vote.
+
+        The pool is three things, not one: the candidates regenerated from the clarified
+        specification, the candidates written before the answer (`pool_rounds`), and revisions
+        of those earlier candidates made in the light of the answer (`revise_candidates`).
+        Measured against the hidden tests, a passing program exists among the regenerated
+        candidates on 40.6% of tasks and among the pre-answer ones on 37.8%, but among the
+        union on 44.3% - regeneration creates correct programs on some tasks and destroys the
+        only correct one on others, so keeping both is strictly more to choose from.
         """
         rendered = "\n".join(
             f"- Q: {question}\n  A: {answer}" for question, answer in clarifications
@@ -1609,7 +1896,43 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
             except LimitsExceededException:
                 break
             if code and self.defines_entry_point(code, problem["entry_point"]):
-                candidates.append({"code": code, "persona": ""})
+                candidates.append({"code": code, "persona": "", "origin": "regenerated"})
+
+        # Revise one representative per pre-answer behaviour group. This is the step that does
+        # not wait for a visible failure: our generated inputs catch at most 21.3% of the
+        # defects the hidden tests find, so a program that looks clean is not a program that
+        # is right.
+        revisions: list[dict[str, Any]] = []
+        if self.config["revise_candidates"] and previous:
+            groups_for_revision = previous_groups or [[index] for index in range(len(previous))]
+            for index in self.group_representatives(
+                groups_for_revision, self.config["max_revisions"]
+            ):
+                if index >= len(previous):
+                    continue
+                revised = self.revise_program(
+                    env, problem, previous[index]["code"], clarifications
+                )
+                if revised and self.defines_entry_point(revised, problem["entry_point"]):
+                    revisions.append({"code": revised, "persona": "", "origin": "revised"})
+
+        earlier: list[dict[str, Any]] = []
+        if self.config["pool_rounds"]:
+            earlier = [
+                {"code": item["code"], "persona": item.get("persona", ""), "origin": "round1"}
+                for item in previous
+            ]
+
+        candidates = candidates + revisions + earlier
+        self.trace_note("revisions_made", len(revisions))
+        self.trace_note(
+            "pool_size",
+            {
+                "regenerated": sum(1 for c in candidates if c["origin"] == "regenerated"),
+                "revised": len(revisions),
+                "round1": len(earlier),
+            },
+        )
 
         if not candidates:
             return previous[0]["code"] if previous else ""
@@ -1617,7 +1940,8 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
         outputs = self.run_candidates(env, problem, candidates, inputs)
         if outputs is None:
             # No sandbox: fall back to the first clarified candidate, unrepaired, because
-            # there is no way to see whether it fails or whether a repair helped.
+            # there is no way to see whether it fails or whether a repair helped. The pool is
+            # ordered regenerated-first, so this is still a program written with the answer.
             return candidates[0]["code"]
 
         groups = self.group_by_behaviour(outputs, stage="vote")
@@ -1636,11 +1960,8 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
         # below can fire. Keep that in mind before tuning `repair_attempts`.
         valid = self.valid_indices(outputs)
         if groups:
-            groups = sorted(
-                groups,
-                key=lambda group: (self.failures_on_valid(outputs[group[0]], valid), -len(group)),
-            )
-            chosen = groups[0][0]
+            groups = self.rank_groups(groups, outputs, candidates, valid)
+            chosen = self.pick_from_group(groups[0], candidates)
 
             # The majority counts candidates; it does not read the answer the question was
             # spent on. Where the vote is split, ask which behaviour the author described.
@@ -1653,12 +1974,60 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
                 if picked is not None:
                     self.trace_note("adjudicate_choice", picked)
                     self.trace_note("adjudicate_agreed_with_majority", picked == 0)
-                    chosen = groups[picked][0]
+                    chosen = self.pick_from_group(groups[picked], candidates)
         else:
             # Every program is broken; repair below is the only remaining lever.
             chosen = 0
 
         self.trace_note("chosen_failures", self.failures_on_valid(outputs[chosen], valid))
+        self.trace_note("winner_origin", candidates[chosen]["origin"])
+        self.trace_note("winner_was_revised", candidates[chosen]["origin"] == "revised")
+        self.trace_note("pool_groups", [len(group) for group in groups])
+        self.trace_programs("programs_final", candidates)
+        self.trace_note("chosen_index", chosen)
+
+        # The vote has now said what it thinks, from behaviour alone. Give the model the source
+        # of every attempt plus the author's answer and let it write the program itself; the
+        # sandbox stays as a guard, because it is the only check that does not depend on the
+        # model being right about its own work.
+        winner_code = candidates[chosen]["code"]
+        winner_row = outputs[chosen]
+        winner_failures = self.failures_on_valid(winner_row, valid)
+        self.trace_note("vote_winner_failures", winner_failures)
+        self.trace_programs("programs_vote_winner", [{"code": winner_code}])
+
+        if self.config["synthesize_final"]:
+            synthesis = self.synthesise_program(
+                env, problem, clarifications,
+                previous if self.config["synthesis_sources"] == "both" else [],
+                candidates, previous_outputs, outputs, groups, valid,
+            )
+            self.trace_note("synthesis_made", bool(synthesis))
+            if synthesis:
+                self.trace_programs("programs_synthesis", [{"code": synthesis}])
+                synth_outputs = self.run_candidates(
+                    env, problem,
+                    [{"code": synthesis, "persona": "", "origin": "synthesis"}], inputs,
+                )
+                scope = self.config["prefer_synthesis"]
+                if synth_outputs:
+                    synth_failures = self.failures_on_valid(synth_outputs[0], valid)
+                    self.trace_note("synthesis_failures", synth_failures)
+                    self.trace_note(
+                        "synthesis_agreed_with_vote",
+                        [self.signature(synth_outputs[0][i]) for i in valid]
+                        == [self.signature(winner_row[i]) for i in valid],
+                    )
+                    if self.use_synthesis(synth_failures, winner_failures):
+                        self.trace_note("synthesis_used", True)
+                        return self.repaired_or_original(
+                            env, problem, synthesis, synth_outputs[0], inputs,
+                            clarifications, valid,
+                        )
+                elif scope == "always":
+                    # No sandbox for the synthesis: trusting it anyway is what "always" asks.
+                    self.trace_note("synthesis_used", True)
+                    return synthesis
 
         return self.repaired_or_original(
             env,
@@ -1715,6 +2084,7 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
         inputs = self.fit_or_regenerate(env, problem, inputs, candidates)
         self.current_inputs = inputs
         self.trace_note("num_inputs", len(inputs))
+        self.trace_programs("programs_round1", candidates)
 
         # --- Steps 3-6: find a difference, widening the search at most once ----------------
         question = ""
@@ -1816,7 +2186,9 @@ class CuriosityByDesign(ClarificationAlgorithmBase):
             return self.majority_or_fallback(outputs, groups, candidates, fallback_code)
 
         try:
-            final = self.final_program(env, problem, clarifications, inputs, candidates)
+            final = self.final_program(
+                env, problem, clarifications, inputs, candidates, groups, outputs
+            )
         except LimitsExceededException:
             final = ""
 
