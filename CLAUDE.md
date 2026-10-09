@@ -37,7 +37,23 @@ already-generated output (no model calls). Prefer these to answer a question.
 ## Stack and commands
 
 Python 3.13, `uv`, ruff (line-length 100, E/F/I/B, E501 ignored). Deps: litellm, evalplus,
-fire, rich, numpy, tqdm. `ruff` is **not** installed in `.venv` — don't assume lint runs.
+fire, rich, numpy, tqdm. `ruff` is **not** in `.venv`, but `uvx ruff` works and CI runs it, so
+there is no excuse for skipping it:
+
+```bash
+git ls-files '*.py' | xargs uvx ruff check          # CI step "Ruff lint"
+git ls-files '*.py' | xargs uvx ruff format --check  # CI step "Ruff format"
+```
+
+**Pass the tracked files explicitly.** CI runs `uvx ruff format --check .` on a clean checkout;
+locally `.` also sweeps up untracked `tools/` and `runs/`, which reports ~14 extra files to
+reformat and hides the one that matters. `git ls-files` reproduces CI exactly.
+
+This was learned the hard way: the submission PR's first CI run failed on `Ruff format` because
+the file had never been through it — five statements were hand-wrapped that fit inside the
+100-character limit, and ruff joins them back. Formatting is whitespace only (verify with
+`ast.dump` before and after, which must be byte-identical), so it is safe to apply to the
+submission file at any time, but **run it before pushing, not after**.
 
 ```bash
 .venv/bin/python generate_responses.py clarify/algorithms/curiosity_by_design.py --split val

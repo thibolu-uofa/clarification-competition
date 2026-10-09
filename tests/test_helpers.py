@@ -86,7 +86,7 @@ def test_candidate_that_failed_everywhere_gets_no_vote():
     """Without that rule every input looks suspect exactly when all candidates are broken."""
     algorithm = fresh()
     outputs = [
-        [error(), error()],          # no value anywhere: not a voter
+        [error(), error()],  # no value anywhere: not a voter
         [error(), value(["int", 2])],
     ]
     assert algorithm.suspect_inputs(outputs) == {0}
@@ -208,7 +208,10 @@ def test_readable_emits_python_not_json():
     assert algorithm.readable(["tuple", [["int", 1]]]) == "(1,)"
     assert algorithm.readable(["float", "nan"]) == "nan"
     assert algorithm.readable(["set", [json.dumps(["int", 1])]]) == "{1}"
-    assert algorithm.readable(["dict", [[json.dumps(["str", "k"]), json.dumps(["int", 1])]]]) == "{'k': 1}"
+    assert (
+        algorithm.readable(["dict", [[json.dumps(["str", "k"]), json.dumps(["int", 1])]]])
+        == "{'k': 1}"
+    )
     rendered = algorithm.readable(["list", [["int", 1]]])
     assert "true" not in rendered and "null" not in rendered and '"int"' not in rendered
 
@@ -219,9 +222,7 @@ def test_describe_reads_as_a_sentence():
     assert algorithm.describe(value(["list", [["int", 1]]])) == "returns [1] of type list"
     assert algorithm.describe(error("ValueError: empty")) == "raises ValueError: empty"
     assert algorithm.describe({"kind": "timeout"}) == "does not terminate"
-    assert "modifies its arguments in place" in algorithm.describe(
-        value(["int", 1], mutated=True)
-    )
+    assert "modifies its arguments in place" in algorithm.describe(value(["int", 1], mutated=True))
     assert "prints 'hi'" in algorithm.describe(value(["int", 1], printed="hi\n"))
 
 
@@ -380,14 +381,22 @@ def test_fenced_code_parser_matches_the_harness():
             return ("error", str(error))
 
     cases = [
-        "", "no fence at all", "```python", "```python\nx=1\n```", "```\nx=1\n```",
-        "```python```", "```python\n```", "prefix ```python\ndef f():\n    pass\n```",
-        "```python\na\n```\n```python\nb\n```", "```PYTHON\nx\n```",
+        "",
+        "no fence at all",
+        "```python",
+        "```python\nx=1\n```",
+        "```\nx=1\n```",
+        "```python```",
+        "```python\n```",
+        "prefix ```python\ndef f():\n    pass\n```",
+        "```python\na\n```\n```python\nb\n```",
+        "```PYTHON\nx\n```",
     ]
     alphabet = ["```python", "```", "\n", "x=1", "a", " "]
     random.seed(0)
-    cases += ["".join(random.choice(alphabet) for _ in range(random.randint(0, 8)))
-              for _ in range(2000)]
+    cases += [
+        "".join(random.choice(alphabet) for _ in range(random.randint(0, 8))) for _ in range(2000)
+    ]
 
     for text in cases:
         assert outcome(ours, text) == outcome(harness, text), repr(text)
